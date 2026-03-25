@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import pandas as pd
-from longbridge.openapi import AdjustType, Period
+from longbridge.openapi import AdjustType, Market, Period, SecurityListCategory
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import AppSettings
@@ -64,6 +64,30 @@ class LongbridgeQuoteClient:
                         "updated_at": utc_now().isoformat(),
                     }
                 )
+        return pd.DataFrame(records)
+
+    def fetch_security_list(
+        self,
+        market: type = Market.US,
+        category: type | None = None,
+    ) -> pd.DataFrame:
+        if category is None:
+            items = self._retry_call(self.ctx.security_list, market)
+        else:
+            items = self._retry_call(self.ctx.security_list, market, category)
+        records: list[dict[str, Any]] = []
+        for item in items:
+            symbol = getattr(item, "symbol", None)
+            records.append(
+                {
+                    "symbol": symbol,
+                    "name_en": getattr(item, "name_en", None),
+                    "name_cn": getattr(item, "name_cn", None),
+                    "name_hk": getattr(item, "name_hk", None),
+                    "market": symbol.split(".")[-1] if symbol else None,
+                    "category": "overnight" if category is SecurityListCategory.Overnight else None,
+                }
+            )
         return pd.DataFrame(records)
 
     def fetch_latest_quotes(self, symbols: Sequence[str]) -> pd.DataFrame:

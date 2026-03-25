@@ -7,6 +7,7 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+from longbridge.openapi import Market, SecurityListCategory
 
 from app.config import AppSettings
 from app.data_sources.benchmark_loader import load_benchmark_history
@@ -62,7 +63,7 @@ class DailyScanPipeline:
         self.parquet_repo = ParquetRepository(settings.parquet_dir)
 
     def run(self, options: ScanOptions) -> PipelineResult:
-        universe = load_universe(self.settings, options.symbols, options.universe_file)
+        universe, preloaded_bars = self._resolve_universe(options)
         symbols = universe["symbol"].tolist()
         benchmark_symbols = list(
             dict.fromkeys(
@@ -86,7 +87,14 @@ class DailyScanPipeline:
         for row in universe.itertuples(index=False):
             member = UniverseMember(symbol=row.symbol, industry_etf_proxy=row.industry_etf_proxy)
             try:
-                score_card, artifacts = self._evaluate_symbol(member, options.scan_date, static_map, quote_map, benchmark_history)
+                score_card, artifacts = self._evaluate_symbol(
+                    member,
+                    options.scan_date,
+                    static_map,
+                    quote_map,
+                    benchmark_history,
+                    preloaded_bars,
+                )
                 candidate_records.append(score_card.as_record())
                 self._persist_symbol_artifacts(artifacts)
             except Exception as exc:
@@ -180,9 +188,12 @@ class DailyScanPipeline:
         static_map: dict[str, dict[str, Any]],
         quote_map: dict[str, dict[str, Any]],
         benchmark_history: dict[str, pd.DataFrame],
+        preloaded_bars: dict[str, pd.DataFrame],
     ):
         warning_tags: list[str] = []
-        bars = self.quote_client.fetch_history_bars(member.symbol, count=self.settings.lookback_bars)
+        bars = preloaded_bars.get(member.symbol)
+        if bars is None or bars.empty or len(bars) < self.settings.min_history_bars:
+            bars = self.quote_client.fetch_history_bars(member.symbol, count=self.settings.lookback_bars)
         trades = self._safe_optional(self.quote_client.fetch_trades, member.symbol, warning_tag="trades_unavailable", warning_tags=warning_tags)
         depth = self._safe_optional(self.quote_client.fetch_depth, member.symbol, warning_tag="depth_unavailable", warning_tags=warning_tags)
         capital_flow = self._safe_optional(self.quote_client.fetch_capital_flow, member.symbol, warning_tag="capital_flow_unavailable", warning_tags=warning_tags)
@@ -269,6 +280,73 @@ class DailyScanPipeline:
                 self._optional_warning_emitted.add(warning_tag)
             warning_tags.append(warning_tag)
             return default if default is not None else pd.DataFrame()
+
+    def _resolve_universe(self, options: ScanOptions) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+        if options.symbols or options.universe_file:
+            return load_universe(self.settings, options.symbols, options.universe_file), {}
+        if not self.settings.auto_universe_enabled:
+            return load_universe(self.settings, None, None), {}
+        try:
+            return self._build_auto_universe()
+        except Exception as exc:
+            logger.warning("Auto universe build failed (%s), fallback to sample universe.", exc)
+            return load_universe(self.settings, None, None), {}
+
+    def _build_auto_universe(self) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+        market_map = {
+            "US": Market.US,
+            "HK": Market.HK,
+            "CN": Market.CN,
+            "SG": Market.SG,
+            "CRYPTO": Market.Crypto,
+        }
+        market_code = self.settings.auto_universe_market
+        market = market_map.get(market_code, Market.US)
+        category = SecurityListCategory.Overnight if market_code == "US" else None
+        security_frame = self.quote_client.fetch_security_list(market=market, category=category)
+        if security_frame.empty:
+            raise RuntimeError("No symbols returned from Longbridge security_list.")
+
+        security_frame = security_frame.dropna(subset=["symbol"]).copy()
+        security_frame["symbol"] = security_frame["symbol"].astype(str).str.upper()
+        if market_code == "US":
+            security_frame = security_frame[security_frame["symbol"].str.endswith(".US")]
+        security_frame = security_frame.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+        symbols = security_frame["symbol"].tolist()
+        logger.info("Auto universe raw symbols: %s", len(symbols))
+        if not symbols:
+            raise RuntimeError("Auto universe symbol list is empty.")
+
+        quote_frame = self.quote_client.fetch_latest_quotes(symbols)
+        if quote_frame.empty:
+            raise RuntimeError("Unable to fetch quote snapshot for auto universe.")
+
+        quote_frame["last_done"] = pd.to_numeric(quote_frame["last_done"], errors="coerce")
+        quote_frame["turnover"] = pd.to_numeric(quote_frame["turnover"], errors="coerce")
+        quote_frame["volume"] = pd.to_numeric(quote_frame["volume"], errors="coerce")
+        quote_frame["turnover_proxy"] = quote_frame["turnover"].fillna(
+            quote_frame["last_done"] * quote_frame["volume"]
+        )
+        liquid = quote_frame[
+            (quote_frame["last_done"] >= self.settings.min_price)
+            & (quote_frame["turnover_proxy"] >= self.settings.auto_universe_min_turnover_usd)
+        ].copy()
+        if liquid.empty:
+            liquid = quote_frame[quote_frame["last_done"] >= self.settings.min_price].copy()
+        liquid = liquid.sort_values("turnover_proxy", ascending=False)
+        eval_symbols = liquid["symbol"].dropna().astype(str).head(self.settings.auto_universe_eval_limit).tolist()
+        logger.info("Auto universe quick liquidity pass symbols: %s", len(eval_symbols))
+        if not eval_symbols:
+            raise RuntimeError("No symbols passed quick liquidity prefilter.")
+
+        selected_symbols = eval_symbols[: self.settings.auto_universe_max_symbols]
+        logger.info("Auto universe selected symbols after liquidity filter: %s", len(selected_symbols))
+        if not selected_symbols:
+            raise RuntimeError("No symbols selected from auto universe.")
+
+        universe = pd.DataFrame({"symbol": selected_symbols})
+        universe["industry_etf_proxy"] = universe["symbol"].map(self.settings.sector_proxy_by_symbol).fillna("SPY.US")
+        return universe.reset_index(drop=True), {}
 
     @property
     def _use_sqlite(self) -> bool:

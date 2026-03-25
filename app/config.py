@@ -85,6 +85,11 @@ class AppSettings:
     min_breakout_buffer: float = 0.005
     max_daily_volatility_warning: float = 0.8
     max_intraday_overheat_pct: float = 0.12
+    auto_universe_enabled: bool = True
+    auto_universe_market: str = "US"
+    auto_universe_min_turnover_usd: float = 2_500_000
+    auto_universe_eval_limit: int = 600
+    auto_universe_max_symbols: int = 120
     enable_html_report: bool = True
     storage_backend: StorageBackend = StorageBackend.SQLITE
     data_dir: Path = field(default_factory=lambda: Path("data").resolve())
@@ -119,6 +124,11 @@ class AppSettings:
             min_breakout_buffer=_env_float("SCREENER_MIN_BREAKOUT_BUFFER", 0.005),
             max_daily_volatility_warning=_env_float("SCREENER_MAX_DAILY_VOLATILITY_WARNING", 0.8),
             max_intraday_overheat_pct=_env_float("SCREENER_MAX_INTRADAY_OVERHEAT_PCT", 0.12),
+            auto_universe_enabled=_env_bool("SCREENER_AUTO_UNIVERSE_ENABLED", True),
+            auto_universe_market=os.getenv("SCREENER_AUTO_UNIVERSE_MARKET", "US").strip().upper(),
+            auto_universe_min_turnover_usd=_env_float("SCREENER_AUTO_UNIVERSE_MIN_TURNOVER_USD", 2_500_000),
+            auto_universe_eval_limit=_env_int("SCREENER_AUTO_UNIVERSE_EVAL_LIMIT", 600),
+            auto_universe_max_symbols=_env_int("SCREENER_AUTO_UNIVERSE_MAX_SYMBOLS", 120),
             enable_html_report=_env_bool("SCREENER_ENABLE_HTML_REPORT", True),
             storage_backend=backend,
             data_dir=_env_path("SCREENER_DATA_DIR", root, "data"),
