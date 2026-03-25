@@ -1,0 +1,16 @@
+.env
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.sqlite3
+data/cache/
+data/parquet/
+logs/
+outputs/
+htmlcov/
+coverage.xml
+
