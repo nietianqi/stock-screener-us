@@ -8,7 +8,8 @@
 - 主数据源只依赖 Longbridge v1 可直接获取的数据
 - 支持静态信息、实时行情、历史日线、逐笔、盘口、资金流、filings、news/topics、option chain
 - 外部增强因子保留为空值，不会导致程序失败
-- 输出 CSV、HTML，并缓存到 SQLite / Parquet
+- 输出 CSV、HTML，并默认缓存到 SQLite
+- 如需 Parquet，可显式设置 `SCREENER_STORAGE_BACKEND=parquet` 或 `both`
 
 ## 目录
 

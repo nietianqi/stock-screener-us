@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
+from longbridge.openapi import OpenApiException
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import AppSettings
@@ -14,6 +15,7 @@ class LongbridgeOptionsClient:
     def __init__(self, settings: AppSettings, quote_context: Any) -> None:
         self.settings = settings
         self.ctx = quote_context
+        self._quote_access_unavailable = False
 
     def _retry_call(self, func: Any, *args: Any) -> Any:
         retrying = Retrying(
@@ -47,9 +49,15 @@ class LongbridgeOptionsClient:
         return pd.DataFrame(records)
 
     def fetch_option_quotes(self, option_symbols: Sequence[str]) -> pd.DataFrame:
-        if not option_symbols:
+        if not option_symbols or self._quote_access_unavailable:
             return pd.DataFrame()
-        items = self._retry_call(self.ctx.option_quote, list(option_symbols))
+        try:
+            items = self._retry_call(self.ctx.option_quote, list(option_symbols))
+        except OpenApiException as exc:
+            if exc.code == 301604:
+                self._quote_access_unavailable = True
+                return pd.DataFrame()
+            raise
         records: list[dict[str, Any]] = []
         for item in items:
             direction = getattr(item, "direction", None)
@@ -84,6 +92,8 @@ class LongbridgeOptionsClient:
             "option_activity_score": None,
             "nearest_option_expiry_days": None,
         }
+        if self._quote_access_unavailable:
+            return empty_snapshot
         expiry_dates = self.fetch_option_expiry_dates(symbol)[:2]
         if not expiry_dates:
             return empty_snapshot
@@ -137,4 +147,3 @@ class LongbridgeOptionsClient:
             "option_activity_score": clamp(ratio_score),
             "nearest_option_expiry_days": None,
         }
-

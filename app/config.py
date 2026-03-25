@@ -86,7 +86,7 @@ class AppSettings:
     max_daily_volatility_warning: float = 0.8
     max_intraday_overheat_pct: float = 0.12
     enable_html_report: bool = True
-    storage_backend: StorageBackend = StorageBackend.BOTH
+    storage_backend: StorageBackend = StorageBackend.SQLITE
     data_dir: Path = field(default_factory=lambda: Path("data").resolve())
     output_dir: Path = field(default_factory=lambda: Path("outputs").resolve())
     log_dir: Path = field(default_factory=lambda: Path("logs").resolve())
@@ -101,7 +101,7 @@ class AppSettings:
     def load(cls, project_root: Path | None = None) -> "AppSettings":
         root = Path(project_root or Path.cwd()).resolve()
         load_dotenv(root / ".env")
-        backend = StorageBackend(os.getenv("SCREENER_STORAGE_BACKEND", StorageBackend.BOTH.value))
+        backend = StorageBackend(os.getenv("SCREENER_STORAGE_BACKEND", StorageBackend.SQLITE.value))
         settings = cls(
             project_root=root,
             longbridge_client_id=os.getenv("LONGBRIDGE_CLIENT_ID") or LONG_BRIDGE_LOCAL_CREDENTIALS.get("client_id"),
