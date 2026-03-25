@@ -58,7 +58,9 @@ class LongbridgeQuoteClient:
                         "lot_size": getattr(item, "lot_size", None),
                         "market": symbol.split(".")[-1] if symbol else None,
                         "board": _type_name(getattr(item, "board", None)),
-                        "industry_etf_proxy": None,
+                        "industry_etf_proxy": self.settings.sector_proxy_by_symbol.get(
+                            symbol or "", None
+                        ),
                         "updated_at": utc_now().isoformat(),
                     }
                 )
@@ -94,6 +96,7 @@ class LongbridgeQuoteClient:
         anchor_time: datetime | None = None,
     ) -> pd.DataFrame:
         bar_count = min(count or self.settings.lookback_bars, 1000)
+        _anchor = anchor_time or utc_now()
         items = self._retry_call(
             self.ctx.history_candlesticks_by_offset,
             symbol,
@@ -101,7 +104,7 @@ class LongbridgeQuoteClient:
             AdjustType.ForwardAdjust,
             False,
             bar_count,
-            anchor_time,
+            _anchor,
         )
         records: list[dict[str, Any]] = []
         for item in items:
@@ -141,8 +144,8 @@ class LongbridgeQuoteClient:
             )
         return pd.DataFrame(records)
 
-    def fetch_trades(self, symbol: str) -> pd.DataFrame:
-        items = self._retry_call(self.ctx.trades, symbol)
+    def fetch_trades(self, symbol: str, count: int = 200) -> pd.DataFrame:
+        items = self._retry_call(self.ctx.trades, symbol, count)
         records: list[dict[str, Any]] = []
         for item in items:
             timestamp = ensure_utc(getattr(item, "timestamp", None))
@@ -153,7 +156,7 @@ class LongbridgeQuoteClient:
                     "price": safe_float(getattr(item, "price", None)),
                     "volume": getattr(item, "volume", None),
                     "trade_type": getattr(item, "trade_type", None),
-                    "direction": _type_name(getattr(item, "direction", None)),
+                    "direction": getattr(getattr(item, "direction", None), "name", None) or str(getattr(item, "direction", None)),
                     "trade_session": _type_name(getattr(item, "trade_session", None)),
                 }
             )
@@ -209,4 +212,3 @@ class LongbridgeQuoteClient:
                 }
             ]
         )
-

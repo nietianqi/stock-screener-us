@@ -8,6 +8,11 @@ from dotenv import load_dotenv
 
 from app.enums import StorageBackend
 
+try:
+    from app.local_credentials import LONG_BRIDGE_LOCAL_CREDENTIALS
+except ImportError:
+    LONG_BRIDGE_LOCAL_CREDENTIALS = {}
+
 DEFAULT_SYMBOLS = (
     "AAPL.US",
     "MSFT.US",
@@ -66,6 +71,9 @@ def _env_path(name: str, project_root: Path, default: str) -> Path:
 class AppSettings:
     project_root: Path
     longbridge_client_id: str | None
+    longbridge_app_key: str | None = None
+    longbridge_app_secret: str | None = None
+    longbridge_access_token: str | None = None
     oauth_callback_port: int = 60355
     request_batch_size: int = 500
     request_timeout_seconds: int = 20
@@ -96,7 +104,10 @@ class AppSettings:
         backend = StorageBackend(os.getenv("SCREENER_STORAGE_BACKEND", StorageBackend.BOTH.value))
         settings = cls(
             project_root=root,
-            longbridge_client_id=os.getenv("LONGBRIDGE_CLIENT_ID"),
+            longbridge_client_id=os.getenv("LONGBRIDGE_CLIENT_ID") or LONG_BRIDGE_LOCAL_CREDENTIALS.get("client_id"),
+            longbridge_app_key=os.getenv("LONGBRIDGE_APP_KEY") or LONG_BRIDGE_LOCAL_CREDENTIALS.get("app_key"),
+            longbridge_app_secret=os.getenv("LONGBRIDGE_APP_SECRET") or LONG_BRIDGE_LOCAL_CREDENTIALS.get("app_secret"),
+            longbridge_access_token=os.getenv("LONGBRIDGE_ACCESS_TOKEN") or LONG_BRIDGE_LOCAL_CREDENTIALS.get("access_token"),
             oauth_callback_port=_env_int("LONGBRIDGE_CALLBACK_PORT", 60355),
             request_batch_size=_env_int("SCREENER_REQUEST_BATCH_SIZE", 500),
             request_timeout_seconds=_env_int("SCREENER_REQUEST_TIMEOUT_SECONDS", 20),
@@ -126,4 +137,3 @@ class AppSettings:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
-

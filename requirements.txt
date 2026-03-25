@@ -1,4 +1,5 @@
 longbridge>=4.0.5
+numpy>=2.0
 pandas>=2.2
 pyarrow>=18.0
 python-dotenv>=1.0

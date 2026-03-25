@@ -1,4 +1,6 @@
 .env
+app/local_credentials.py
+.idea/
 .pytest_cache/
 __pycache__/
 *.pyc
@@ -13,4 +15,3 @@ logs/
 outputs/
 htmlcov/
 coverage.xml
-

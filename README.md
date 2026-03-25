@@ -39,6 +39,8 @@ pip install -r requirements.txt
 
 Longbridge SDK 会把 token 缓存到本地，后续运行可直接复用。
 
+如果你更希望把 API Key 写到本地 Python 配置里，可以参考 `app/local_credentials.example.py` 创建 `app/local_credentials.py`。该文件已在 `.gitignore` 中忽略，不会被推送。
+
 ## 股票池
 
 默认读取 `data/universe_sample.csv`，也可以用参数覆盖：

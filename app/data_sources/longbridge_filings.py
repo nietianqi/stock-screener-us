@@ -107,4 +107,3 @@ class LongbridgeEventClient:
                 }
             )
         return pd.DataFrame(records)
-
