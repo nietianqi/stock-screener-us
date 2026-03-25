@@ -120,12 +120,56 @@ class SQLiteRepository:
     def upsert_dataframe(self, table_name: str, frame: pd.DataFrame, key_columns: list[str]) -> None:
         if frame.empty:
             return
+        working = frame.copy()
+        if key_columns:
+            working = working.drop_duplicates(subset=key_columns, keep="last").reset_index(drop=True)
         with self._connect() as connection:
             if key_columns:
-                key_frame = frame[key_columns].drop_duplicates()
+                key_frame = working[key_columns].drop_duplicates()
                 placeholders = " AND ".join(f"{column} = ?" for column in key_columns)
                 delete_sql = f"DELETE FROM {table_name} WHERE {placeholders}"
                 rows = [tuple(row[column] for column in key_columns) for _, row in key_frame.iterrows()]
                 connection.executemany(delete_sql, rows)
-            frame.to_sql(table_name, connection, if_exists="append", index=False)
+            working.to_sql(table_name, connection, if_exists="append", index=False)
 
+    def query_bars(
+        self,
+        symbol: str,
+        since: "date",
+        until: "date",
+        period: str = "Day",
+    ) -> pd.DataFrame:
+        """读取单支股票的缓存日线 K 线。"""
+        sql = (
+            "SELECT * FROM daily_bar "
+            "WHERE symbol = ? AND period = ? AND date >= ? AND date <= ? "
+            "ORDER BY date ASC"
+        )
+        with self._connect() as connection:
+            df = pd.read_sql_query(
+                sql,
+                connection,
+                params=(symbol, period, since.isoformat(), until.isoformat()),
+            )
+        return df
+
+    def query_bars_bulk(
+        self,
+        symbols: list[str],
+        since: "date",
+        until: "date",
+        period: str = "Day",
+    ) -> pd.DataFrame:
+        """批量读取多支股票的缓存日线 K 线，返回合并 DataFrame。"""
+        if not symbols:
+            return pd.DataFrame()
+        placeholders = ",".join("?" for _ in symbols)
+        sql = (
+            f"SELECT * FROM daily_bar "
+            f"WHERE symbol IN ({placeholders}) AND period = ? AND date >= ? AND date <= ? "
+            f"ORDER BY symbol, date ASC"
+        )
+        params = (*symbols, period, since.isoformat(), until.isoformat())
+        with self._connect() as connection:
+            df = pd.read_sql_query(sql, connection, params=params)
+        return df

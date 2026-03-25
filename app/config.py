@@ -90,6 +90,10 @@ class AppSettings:
     auto_universe_min_turnover_usd: float = 2_500_000
     auto_universe_eval_limit: int = 600
     auto_universe_max_symbols: int = 120
+    auto_universe_bar_concurrency: int = 8
+    universe_cache_ttl_minutes: int = 60
+    api_budget_history_bars: int = 0
+    api_budget_quote: int = 0
     enable_html_report: bool = True
     storage_backend: StorageBackend = StorageBackend.SQLITE
     data_dir: Path = field(default_factory=lambda: Path("data").resolve())
@@ -129,6 +133,10 @@ class AppSettings:
             auto_universe_min_turnover_usd=_env_float("SCREENER_AUTO_UNIVERSE_MIN_TURNOVER_USD", 2_500_000),
             auto_universe_eval_limit=_env_int("SCREENER_AUTO_UNIVERSE_EVAL_LIMIT", 600),
             auto_universe_max_symbols=_env_int("SCREENER_AUTO_UNIVERSE_MAX_SYMBOLS", 120),
+            auto_universe_bar_concurrency=_env_int("SCREENER_AUTO_UNIVERSE_BAR_CONCURRENCY", 8),
+            universe_cache_ttl_minutes=_env_int("SCREENER_UNIVERSE_CACHE_TTL_MINUTES", 60),
+            api_budget_history_bars=_env_int("SCREENER_API_BUDGET_HISTORY_BARS", 0),
+            api_budget_quote=_env_int("SCREENER_API_BUDGET_QUOTE", 0),
             enable_html_report=_env_bool("SCREENER_ENABLE_HTML_REPORT", True),
             storage_backend=backend,
             data_dir=_env_path("SCREENER_DATA_DIR", root, "data"),
