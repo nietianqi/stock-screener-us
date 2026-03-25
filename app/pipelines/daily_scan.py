@@ -26,6 +26,7 @@ from app.factors.risk_control import compute_risk_metrics
 from app.factors.trend import compute_trend_metrics
 from app.factors.volume_pattern import compute_volume_pattern_metrics
 from app.models import PipelineResult, UniverseMember
+from app.enums import StorageBackend
 from app.pipelines.universe_pipeline import load_universe
 from app.reports.candidate_report import export_csv
 from app.reports.html_export import export_html
@@ -49,6 +50,7 @@ class ScanOptions:
 class DailyScanPipeline:
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
+        self._optional_warning_emitted: set[str] = set()
         session_factory = LongbridgeSessionFactory(settings)
         quote_context = session_factory.build_quote_context()
         content_context = session_factory.build_content_context()
@@ -129,8 +131,10 @@ class DailyScanPipeline:
                 "veto_reasons",
                 "payload_json",
             ]
-            self.sqlite_repo.upsert_dataframe("factor_table", candidates[factor_columns], ["symbol", "scan_date"])
-            self.parquet_repo.save_dataframe("factor_table", candidates)
+            if self._use_sqlite:
+                self.sqlite_repo.upsert_dataframe("factor_table", candidates[factor_columns], ["symbol", "scan_date"])
+            if self._use_parquet:
+                self.parquet_repo.save_dataframe("factor_table", candidates)
 
         output_dir = self.settings.output_dir / options.scan_date.isoformat()
         candidates_path = export_csv(
@@ -152,19 +156,21 @@ class DailyScanPipeline:
         return PipelineResult(candidates=candidates, failures=failures, artifacts=artifacts)
 
     def _persist_baseline(self, static_info: pd.DataFrame, latest_quotes: pd.DataFrame) -> None:
-        self.sqlite_repo.upsert_dataframe("symbol_master", static_info, ["symbol"])
-        self.sqlite_repo.upsert_dataframe("realtime_snapshot", latest_quotes, ["symbol"])
-        self.parquet_repo.save_dataframe("symbol_master", static_info)
-        self.parquet_repo.save_dataframe("realtime_snapshot", latest_quotes)
+        if self._use_sqlite:
+            self.sqlite_repo.upsert_dataframe("symbol_master", static_info, ["symbol"])
+            self.sqlite_repo.upsert_dataframe("realtime_snapshot", latest_quotes, ["symbol"])
+        if self._use_parquet:
+            self.parquet_repo.save_dataframe("symbol_master", static_info)
+            self.parquet_repo.save_dataframe("realtime_snapshot", latest_quotes)
 
     def _persist_symbol_artifacts(self, artifacts: dict[str, pd.DataFrame]) -> None:
-        if not artifacts["bars"].empty:
+        if self._use_sqlite and not artifacts["bars"].empty:
             self.sqlite_repo.upsert_dataframe("daily_bar", artifacts["bars"], ["symbol", "date", "period"])
-        if not artifacts["filings"].empty:
+        if self._use_sqlite and not artifacts["filings"].empty:
             self.sqlite_repo.upsert_dataframe("filings_table", artifacts["filings"], ["symbol", "filing_id"])
-        if not artifacts["news"].empty:
+        if self._use_sqlite and not artifacts["news"].empty:
             self.sqlite_repo.upsert_dataframe("news_table", artifacts["news"], ["symbol", "news_id"])
-        if not artifacts["topics"].empty:
+        if self._use_sqlite and not artifacts["topics"].empty:
             self.sqlite_repo.upsert_dataframe("topic_table", artifacts["topics"], ["symbol", "topic_id"])
 
     def _evaluate_symbol(
@@ -257,8 +263,17 @@ class DailyScanPipeline:
     ) -> Any:
         try:
             return func(*args)
-        except Exception:
-            logger.warning("Optional fetch failed for %s", warning_tag, exc_info=True)
+        except Exception as exc:
+            if warning_tag not in self._optional_warning_emitted:
+                logger.warning("Optional fetch failed for %s: %s", warning_tag, exc)
+                self._optional_warning_emitted.add(warning_tag)
             warning_tags.append(warning_tag)
             return default if default is not None else pd.DataFrame()
 
+    @property
+    def _use_sqlite(self) -> bool:
+        return self.settings.storage_backend in {StorageBackend.SQLITE, StorageBackend.BOTH}
+
+    @property
+    def _use_parquet(self) -> bool:
+        return self.settings.storage_backend in {StorageBackend.PARQUET, StorageBackend.BOTH}
