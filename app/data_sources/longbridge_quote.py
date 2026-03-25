@@ -1,16 +1,39 @@
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Iterable, Sequence
 from datetime import datetime
+from threading import Lock
 from typing import Any
 
 import pandas as pd
 from longbridge.openapi import AdjustType, Market, Period, SecurityListCategory
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.config import AppSettings
 from app.utils.dates import ensure_utc, utc_now
 from app.utils.mathx import safe_float
+
+logger = logging.getLogger(__name__)
+
+
+def _empty_bars_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "symbol",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "turnover",
+            "period",
+            "timestamp_utc",
+            "trade_session",
+        ]
+    )
 
 
 def _type_name(value: object) -> str | None:
@@ -25,18 +48,50 @@ class LongbridgeQuoteClient:
     def __init__(self, settings: AppSettings, quote_context: Any) -> None:
         self.settings = settings
         self.ctx = quote_context
+        self._history_unavailable_symbols: set[str] = set()
+        self._history_lock = Lock()
 
     def _retry_call(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         retrying = Retrying(
             stop=stop_after_attempt(self.settings.api_max_retries),
             wait=wait_exponential(multiplier=1, min=1, max=8),
-            retry=retry_if_exception_type(Exception),
+            retry=retry_if_exception(self._should_retry_exception),
             reraise=True,
         )
         for attempt in retrying:
             with attempt:
                 return func(*args, **kwargs)
         return None
+
+    @staticmethod
+    def _should_retry_exception(exc: Exception) -> bool:
+        message = str(exc).lower()
+        non_retryable_markers = (
+            "301607",
+            "count out of limit",
+            "301604",
+            "no quote access",
+            "permission denied",
+        )
+        return not any(marker in message for marker in non_retryable_markers)
+
+    @staticmethod
+    def _is_history_unavailable_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        markers = (
+            "301607",
+            "history kline symbol count out of limit",
+            "count out of limit",
+        )
+        return any(marker in message for marker in markers)
+
+    def _mark_history_unavailable(self, symbol: str) -> None:
+        with self._history_lock:
+            self._history_unavailable_symbols.add(symbol)
+
+    def _is_history_unavailable_symbol(self, symbol: str) -> bool:
+        with self._history_lock:
+            return symbol in self._history_unavailable_symbols
 
     def _chunk(self, symbols: Sequence[str]) -> Iterable[list[str]]:
         chunk_size = max(1, min(500, self.settings.request_batch_size))
@@ -119,17 +174,43 @@ class LongbridgeQuoteClient:
         count: int | None = None,
         anchor_time: datetime | None = None,
     ) -> pd.DataFrame:
+        if self._is_history_unavailable_symbol(symbol):
+            return _empty_bars_frame()
         bar_count = min(count or self.settings.lookback_bars, 1000)
         _anchor = anchor_time or utc_now()
-        items = self._retry_call(
-            self.ctx.history_candlesticks_by_offset,
-            symbol,
-            period,
-            AdjustType.ForwardAdjust,
-            False,
-            bar_count,
-            _anchor,
-        )
+        items = None
+        last_error: Exception | None = None
+        candidates = self._history_bar_count_candidates(bar_count)
+        for index, requested in enumerate(candidates):
+            try:
+                items = self._retry_call(
+                    self.ctx.history_candlesticks_by_offset,
+                    symbol,
+                    period,
+                    AdjustType.ForwardAdjust,
+                    False,
+                    requested,
+                    _anchor,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if self._is_history_unavailable_error(exc):
+                    if index < len(candidates) - 1:
+                        logger.debug(
+                            "[quote] history bar count %d rejected for %s, retrying with lower count.",
+                            requested,
+                            symbol,
+                        )
+                    continue
+                raise
+        if items is None:
+            if last_error is not None:
+                if self._is_history_unavailable_error(last_error):
+                    self._mark_history_unavailable(symbol)
+                    return _empty_bars_frame()
+                raise last_error
+            return _empty_bars_frame()
         records: list[dict[str, Any]] = []
         for item in items:
             timestamp = ensure_utc(getattr(item, "timestamp", None))
@@ -149,7 +230,61 @@ class LongbridgeQuoteClient:
                     "trade_session": _type_name(getattr(item, "trade_session", None)),
                 }
             )
+        if not records:
+            return _empty_bars_frame()
         return pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+
+    @staticmethod
+    def _history_bar_count_candidates(requested: int) -> list[int]:
+        if requested <= 250:
+            return [requested]
+        return [requested, 250]
+
+    def fetch_history_bars_concurrent(
+        self,
+        symbols: Sequence[str],
+        period: type = Period.Day,
+        count: int | None = None,
+        concurrency: int = 8,
+    ) -> dict[str, pd.DataFrame]:
+        symbol_list = list(dict.fromkeys(symbols))
+        if not symbol_list:
+            return {}
+        max_workers = max(1, min(int(concurrency), len(symbol_list)))
+        if max_workers == 1:
+            return {symbol: self.fetch_history_bars(symbol, period=period, count=count) for symbol in symbol_list}
+
+        results: dict[str, pd.DataFrame] = {}
+        hard_failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bars") as pool:
+            futures = {
+                pool.submit(self.fetch_history_bars, symbol, period, count): symbol
+                for symbol in symbol_list
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:
+                    logger.warning("[quote] failed to fetch history bars for %s: %s", symbol, exc)
+                    results[symbol] = _empty_bars_frame()
+                    hard_failures.append(symbol)
+        unavailable = [symbol for symbol in symbol_list if results.get(symbol, _empty_bars_frame()).empty and self._is_history_unavailable_symbol(symbol)]
+        if unavailable:
+            sample = ", ".join(unavailable[:5])
+            logger.info(
+                "[quote] history bars unavailable for %d symbol(s); skipped. examples: %s",
+                len(unavailable),
+                sample,
+            )
+        if hard_failures:
+            sample = ", ".join(hard_failures[:5])
+            logger.warning(
+                "[quote] history bars failed for %d symbol(s). examples: %s",
+                len(hard_failures),
+                sample,
+            )
+        return results
 
     def fetch_intraday(self, symbol: str) -> pd.DataFrame:
         items = self._retry_call(self.ctx.intraday, symbol)

@@ -42,7 +42,7 @@ def minmax_score(value: float | None, floor: float, ceiling: float) -> float | N
 
 
 def annualized_volatility(close_series: pd.Series, window: int = 20) -> float | None:
-    closes = close_series.dropna()
+    closes = pd.to_numeric(close_series, errors="coerce").dropna()
     if len(closes) < window + 1:
         return None
     returns = np.log(closes / closes.shift(1)).dropna().tail(window)

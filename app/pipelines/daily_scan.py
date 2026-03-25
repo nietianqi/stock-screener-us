@@ -10,11 +10,13 @@ import pandas as pd
 from longbridge.openapi import Market, SecurityListCategory
 
 from app.config import AppSettings
-from app.data_sources.benchmark_loader import load_benchmark_history
+from app.data_sources.api_budget import ENDPOINT_QUOTE, ENDPOINT_SECURITY_LIST, ENDPOINT_STATIC_INFO, ApiBudget
+from app.data_sources.bar_cache import BarCacheManager
 from app.data_sources.longbridge_auth import LongbridgeSessionFactory
 from app.data_sources.longbridge_filings import LongbridgeEventClient
 from app.data_sources.longbridge_options import LongbridgeOptionsClient
 from app.data_sources.longbridge_quote import LongbridgeQuoteClient
+from app.data_sources.universe_cache import UniverseCache
 from app.factors.breakout import compute_breakout_metrics
 from app.factors.earnings_gap import compute_earnings_gap_metrics
 from app.factors.event_catalyst import compute_event_catalyst_metrics
@@ -61,8 +63,13 @@ class DailyScanPipeline:
         self.score_engine = ScoreEngine(settings)
         self.sqlite_repo = SQLiteRepository(settings.database_path)
         self.parquet_repo = ParquetRepository(settings.parquet_dir)
+        self.api_budget = ApiBudget(settings)
+        self.bar_cache = BarCacheManager(settings, self.sqlite_repo, self.quote_client, self.api_budget)
+        self.universe_cache = UniverseCache(settings)
 
     def run(self, options: ScanOptions) -> PipelineResult:
+        self.api_budget.reset()
+        self.bar_cache.reset_stats()
         universe, preloaded_bars = self._resolve_universe(options)
         symbols = universe["symbol"].tolist()
         benchmark_symbols = list(
@@ -73,9 +80,13 @@ class DailyScanPipeline:
         )
         master_symbols = list(dict.fromkeys(symbols + benchmark_symbols))
 
-        static_info = self.quote_client.fetch_static_info(master_symbols)
-        latest_quotes = self.quote_client.fetch_latest_quotes(master_symbols)
-        benchmark_history = load_benchmark_history(self.quote_client, benchmark_symbols, self.settings.lookback_bars)
+        static_info = self._fetch_static_info(master_symbols)
+        latest_quotes = self._fetch_latest_quotes(master_symbols)
+        benchmark_history = self.bar_cache.get_bars_bulk(
+            benchmark_symbols,
+            needed_bars=self.settings.lookback_bars,
+            as_of=options.scan_date,
+        )
 
         self._persist_baseline(static_info, latest_quotes)
 
@@ -161,6 +172,9 @@ class DailyScanPipeline:
                 options.top_n,
             )
             artifacts["candidates_html"] = str(html_path)
+
+        self.bar_cache.log_stats()
+        self.api_budget.log_summary()
         return PipelineResult(candidates=candidates, failures=failures, artifacts=artifacts)
 
     def _persist_baseline(self, static_info: pd.DataFrame, latest_quotes: pd.DataFrame) -> None:
@@ -192,8 +206,12 @@ class DailyScanPipeline:
     ):
         warning_tags: list[str] = []
         bars = preloaded_bars.get(member.symbol)
-        if bars is None or bars.empty or len(bars) < self.settings.min_history_bars:
-            bars = self.quote_client.fetch_history_bars(member.symbol, count=self.settings.lookback_bars)
+        if bars is None:
+            bars = self.bar_cache.get_bars(
+                member.symbol,
+                needed_bars=self.settings.lookback_bars,
+                as_of=scan_date,
+            )
         trades = self._safe_optional(self.quote_client.fetch_trades, member.symbol, warning_tag="trades_unavailable", warning_tags=warning_tags)
         depth = self._safe_optional(self.quote_client.fetch_depth, member.symbol, warning_tag="depth_unavailable", warning_tags=warning_tags)
         capital_flow = self._safe_optional(self.quote_client.fetch_capital_flow, member.symbol, warning_tag="capital_flow_unavailable", warning_tags=warning_tags)
@@ -286,13 +304,22 @@ class DailyScanPipeline:
             return load_universe(self.settings, options.symbols, options.universe_file), {}
         if not self.settings.auto_universe_enabled:
             return load_universe(self.settings, None, None), {}
+        cached_universe = self.universe_cache.load()
+        if cached_universe is not None and not cached_universe.empty:
+            cached_universe = cached_universe.copy()
+            if "industry_etf_proxy" not in cached_universe.columns:
+                cached_universe["industry_etf_proxy"] = cached_universe["symbol"].map(
+                    self.settings.sector_proxy_by_symbol
+                )
+            cached_universe["industry_etf_proxy"] = cached_universe["industry_etf_proxy"].fillna("SPY.US")
+            return cached_universe.drop_duplicates(subset=["symbol"]).reset_index(drop=True), {}
         try:
-            return self._build_auto_universe()
+            return self._build_auto_universe(options.scan_date)
         except Exception as exc:
             logger.warning("Auto universe build failed (%s), fallback to sample universe.", exc)
             return load_universe(self.settings, None, None), {}
 
-    def _build_auto_universe(self) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    def _build_auto_universe(self, scan_date: date) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
         market_map = {
             "US": Market.US,
             "HK": Market.HK,
@@ -303,6 +330,7 @@ class DailyScanPipeline:
         market_code = self.settings.auto_universe_market
         market = market_map.get(market_code, Market.US)
         category = SecurityListCategory.Overnight if market_code == "US" else None
+        self.api_budget.record(ENDPOINT_SECURITY_LIST, 1)
         security_frame = self.quote_client.fetch_security_list(market=market, category=category)
         if security_frame.empty:
             raise RuntimeError("No symbols returned from Longbridge security_list.")
@@ -317,7 +345,7 @@ class DailyScanPipeline:
         if not symbols:
             raise RuntimeError("Auto universe symbol list is empty.")
 
-        quote_frame = self.quote_client.fetch_latest_quotes(symbols)
+        quote_frame = self._fetch_latest_quotes(symbols)
         if quote_frame.empty:
             raise RuntimeError("Unable to fetch quote snapshot for auto universe.")
 
@@ -346,7 +374,55 @@ class DailyScanPipeline:
 
         universe = pd.DataFrame({"symbol": selected_symbols})
         universe["industry_etf_proxy"] = universe["symbol"].map(self.settings.sector_proxy_by_symbol).fillna("SPY.US")
-        return universe.reset_index(drop=True), {}
+        universe = universe.reset_index(drop=True)
+        self.universe_cache.save(universe)
+        preloaded_bars = self.bar_cache.get_bars_bulk(
+            selected_symbols,
+            needed_bars=self.settings.lookback_bars,
+            as_of=scan_date,
+        )
+        return universe, preloaded_bars
+
+    def _fetch_static_info(self, symbols: list[str]) -> pd.DataFrame:
+        if not symbols:
+            return pd.DataFrame()
+        batch_count = max(1, (len(symbols) + self._effective_batch_size - 1) // self._effective_batch_size)
+        self.api_budget.record(ENDPOINT_STATIC_INFO, batch_count)
+        return self.quote_client.fetch_static_info(symbols)
+
+    def _fetch_latest_quotes(self, symbols: list[str]) -> pd.DataFrame:
+        if not symbols:
+            return pd.DataFrame()
+        budgeted_symbols = self._budget_quote_symbols(symbols)
+        if not budgeted_symbols:
+            return pd.DataFrame()
+        return self.quote_client.fetch_latest_quotes(budgeted_symbols)
+
+    def _budget_quote_symbols(self, symbols: list[str]) -> list[str]:
+        if not symbols:
+            return []
+        chunk_size = self._effective_batch_size
+        allowed_symbols: list[str] = []
+        blocked_batches = 0
+        for start in range(0, len(symbols), chunk_size):
+            batch = symbols[start:start + chunk_size]
+            marker = batch[0] if batch else ""
+            if self.api_budget.consume(ENDPOINT_QUOTE, marker):
+                allowed_symbols.extend(batch)
+            else:
+                blocked_batches += 1
+        if blocked_batches > 0:
+            logger.warning(
+                "Quote budget blocked %d batch(es). Requested=%d symbols, allowed=%d symbols.",
+                blocked_batches,
+                len(symbols),
+                len(allowed_symbols),
+            )
+        return allowed_symbols
+
+    @property
+    def _effective_batch_size(self) -> int:
+        return max(1, min(500, int(self.settings.request_batch_size)))
 
     @property
     def _use_sqlite(self) -> bool:
